@@ -1,14 +1,16 @@
-// The forge's trial lifecycle: start the app, announce ourselves to the
+// The forge's trial lifecycle: start the Go core, announce ourselves to the
 // grading environment, then wait quietly until the suite finishes.
 //
 // The environment hands us its address through MAKEFUN_ENV_URL. The dance is
-// three moves: open a port, tell the environment which port it is, and keep
-// asking whether the trial is over until the answer turns to yes. Nothing
-// else happens here — every git, REST, GraphQL and MCP answer comes from the
-// application in app.ts.
+// three moves: launch ./forge (it prints FORGE_PORT=<port> on stdout), tell
+// the environment which port it is, and keep asking whether the trial is over
+// until the answer turns to yes. Nothing else happens here — every git, REST,
+// GraphQL and MCP answer comes from the Go core in src/.
 
-import { createApp } from './app.ts';
-import type { AddressInfo } from 'node:net';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { chmod } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // How long to wait before asking again, and how long each ask may hang.
 const FIRST_WAIT_MS = 250;
@@ -39,6 +41,40 @@ function envOrigin(): string {
 
 function withPath(origin: string, path: string): string {
   return `${origin}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function forgeBinaryPath(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return join(here, 'forge');
+}
+
+async function startForge(): Promise<{ child: ChildProcess; port: number }> {
+  const binary = forgeBinaryPath();
+  // The binary may have arrived from a git push with its executable bit
+  // stripped; restore it before launching.
+  await chmod(binary, 0o755).catch(() => undefined);
+  const child = spawn(binary, [], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const port = await new Promise<number>((resolve, reject) => {
+    let seen = '';
+    const onData = (chunk: Buffer): void => {
+      seen += chunk.toString('utf8');
+      const match = seen.match(/FORGE_PORT=(\d+)/);
+      if (match !== null) {
+        child.stdout?.off('data', onData);
+        resolve(Number(match[1]));
+      }
+    };
+    child.stdout?.on('data', onData);
+    child.once('error', (err) => {
+      child.stdout?.off('data', onData);
+      reject(new Error(`could not launch the forge core: ${err.message}`));
+    });
+    child.once('exit', (code) => {
+      child.stdout?.off('data', onData);
+      reject(new Error(`the forge core exited before announcing a port (code ${code})`));
+    });
+  });
+  return { child, port };
 }
 
 async function announce(origin: string, port: number): Promise<void> {
@@ -112,31 +148,22 @@ async function waitForFinish(origin: string): Promise<void> {
 
 async function run(): Promise<number> {
   const origin = envOrigin();
-  const forge = createApp();
-
-  const boundPort = await new Promise<number>((resolve, reject) => {
-    forge.once('error', reject);
-    forge.listen(0, '0.0.0.0', () => {
-      forge.removeListener('error', reject);
-      const address = forge.address() as AddressInfo | string | null;
-      if (address === null || typeof address === 'string') {
-        reject(new Error('the forge bound without a TCP port'));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
+  const { child, port } = await startForge();
 
   const stop = (): void => {
-    forge.close(() => process.exit(EXIT_DONE));
+    child.kill('SIGTERM');
     setTimeout(() => process.exit(EXIT_DONE), 1000).unref();
   };
   process.on('SIGTERM', stop);
   process.on('SIGINT', stop);
+  child.once('exit', () => {
+    process.stderr.write('forge: the core exited early\n');
+    process.exit(EXIT_FAILED);
+  });
 
-  await announce(origin, boundPort);
+  await announce(origin, port);
   await waitForFinish(origin);
-  forge.close();
+  child.kill('SIGTERM');
   return EXIT_DONE;
 }
 

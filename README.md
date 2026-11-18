@@ -4,12 +4,18 @@
 [![rank](https://make.fun/badge/github-core-clone-01/sami30357/git-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/sami30357/git-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A standalone, GitHub-compatible git forge in one Node 22 process: git smart HTTP v2, REST v3, GraphQL and MCP over a single in-memory store. Local conformance 120/120, score 923/1000.
+A standalone, GitHub-compatible git forge: git smart HTTP v2, REST v3, GraphQL and MCP over a single in-memory store. The forge itself is a static Go core (`forge`, built from `src/` with no dependencies) launched by `main.ts`, which handles the trial lifecycle (announce the port, wait for the suite to finish). Local conformance 120/120.
 
 ## Run it
 
 ```sh
 node main.ts
+```
+
+To rebuild the Go core:
+
+```sh
+cd src && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../forge .
 ```
 
 ---
