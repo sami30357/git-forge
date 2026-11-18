@@ -1,175 +1,263 @@
-// The forge's trial lifecycle: start the Go core, announce ourselves to the
-// grading environment, then wait quietly until the suite finishes.
+// main.ts — trial lifecycle for the v8 Rust forge.
 //
-// The environment hands us its address through MAKEFUN_ENV_URL. The dance is
-// three moves: launch ./forge (it prints FORGE_PORT=<port> on stdout), tell
-// the environment which port it is, and keep asking whether the trial is over
-// until the answer turns to yes. Nothing else happens here — every git, REST,
-// GraphQL and MCP answer comes from the Go core in src/.
+// The forge core is one static binary, ./forge, built from src/ in Rust.
+// It is launched from a scratch copy, never from the repo checkout: a
+// file that arrives through the GitHub web UI is mode 644 owned by
+// another user, so chmod on the checkout copy fails (EPERM) and spawning
+// it fails (EACCES). That is exactly how the previous Go entry scored 0
+// despite passing 120/120 locally — it never ran in grading. Copying the
+// binary to a directory the running user owns, chmod 755 there, and
+// spawning the copy makes the launch independent of the checkout's mode
+// and owner. The repo copy is still tried (after a best-effort chmod) as
+// a fallback, and so is $HOME/.cache, in case the system temp dir is
+// mounted noexec.
+//
+// Lifecycle (github-core-clone-01 wire contract):
+//   1. launch the forge; it binds an ephemeral port and prints
+//      FORGE_PORT=<port> on stdout;
+//   2. POST $MAKEFUN_ENV_URL/register {"port": N} (first register wins);
+//   3. poll GET $MAKEFUN_ENV_URL/done until {"done": true}, then exit 0.
+// Without MAKEFUN_ENV_URL (a plain local run) the forge just keeps
+// running until it is killed.
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { chmod } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { chmod, copyFile, mkdir, unlink } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-// How long to wait before asking again, and how long each ask may hang.
-const FIRST_WAIT_MS = 250;
-const LONGEST_WAIT_MS = 2000;
-const ASK_TIMEOUT_MS = 10000;
+const here = path.dirname(fileURLToPath(import.meta.url));
+const REPO_BINARY = path.join(here, "forge");
 
-// How long we keep trying to announce ourselves before giving up.
-const ANNOUNCE_WINDOW_MS = 15000;
+// How long to wait for a candidate binary to print FORGE_PORT.
+const PORT_WAIT_MS = 8_000;
+// How many times to retry the register POST before giving up.
+const REGISTER_ATTEMPTS = 12;
+const REGISTER_RETRY_MS = 500;
+// Done polling: exponential backoff 250ms -> 2000ms (wire contract),
+// never holding a request open longer than 30s.
+const DONE_POLL_FIRST_MS = 250;
+const DONE_POLL_MAX_MS = 2_000;
+const DONE_REQUEST_TIMEOUT_MS = 30_000;
 
-// The exit code once the environment reports the trial as finished.
-const EXIT_DONE = 0;
-const EXIT_FAILED = 1;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-function nap(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
+function scratchName(): string {
+  return `forge-${process.pid}-${randomBytes(4).toString("hex")}`;
 }
 
-function envOrigin(): string {
-  const raw = process.env.MAKEFUN_ENV_URL ?? '';
-  const trimmed = raw.trim().replace(/\/+$/, '');
-  if (trimmed === '') {
-    throw new Error('MAKEFUN_ENV_URL is not set: the grading environment never introduced itself');
-  }
-  return trimmed;
+interface Launched {
+  child: ChildProcess;
+  port: number;
+  launchedFrom: string;
+  scratchPath: string | null;
 }
 
-function withPath(origin: string, path: string): string {
-  return `${origin}${path.startsWith('/') ? path : `/${path}`}`;
-}
-
-function forgeBinaryPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  return join(here, 'forge');
-}
-
-async function startForge(): Promise<{ child: ChildProcess; port: number }> {
-  const binary = forgeBinaryPath();
-  // The binary may have arrived from a git push with its executable bit
-  // stripped; restore it before launching.
-  await chmod(binary, 0o755).catch(() => undefined);
-  const child = spawn(binary, [], { stdio: ['ignore', 'pipe', 'inherit'] });
-  const port = await new Promise<number>((resolve, reject) => {
-    let seen = '';
-    const onData = (chunk: Buffer): void => {
-      seen += chunk.toString('utf8');
-      const match = seen.match(/FORGE_PORT=(\d+)/);
-      if (match !== null) {
-        child.stdout?.off('data', onData);
-        resolve(Number(match[1]));
-      }
+/** Spawn one candidate binary and wait for its FORGE_PORT line. */
+function trySpawn(binaryPath: string): Promise<Launched> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binaryPath, [], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(
+        new Error(
+          `${binaryPath}: no FORGE_PORT in ${PORT_WAIT_MS}ms (stderr: ${stderr.slice(-300)})`,
+        ),
+      );
+    }, PORT_WAIT_MS);
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`${binaryPath}: ${err.message}`));
     };
-    child.stdout?.on('data', onData);
-    child.once('error', (err) => {
-      child.stdout?.off('data', onData);
-      reject(new Error(`could not launch the forge core: ${err.message}`));
+    child.on("error", fail);
+    child.on("exit", (code, signal) => {
+      fail(
+        new Error(
+          `exited code=${code} signal=${signal ?? "none"} (stderr: ${stderr.slice(-300)})`,
+        ),
+      );
     });
-    child.once('exit', (code) => {
-      child.stdout?.off('data', onData);
-      reject(new Error(`the forge core exited before announcing a port (code ${code})`));
-    });
-  });
-  return { child, port };
-}
-
-async function announce(origin: string, port: number): Promise<void> {
-  const started = Date.now();
-  let pause = 100;
-  for (;;) {
-    let reply: Response;
-    try {
-      reply = await fetch(withPath(origin, '/register'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(ASK_TIMEOUT_MS),
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (Date.now() - started > ANNOUNCE_WINDOW_MS) {
-        throw new Error(`could not reach the environment to register: ${message}`);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      stdout += chunk.toString("utf8");
+      const match = stdout.match(/^FORGE_PORT=(\d+)\s*$/m);
+      if (match) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          child,
+          port: Number(match[1]),
+          launchedFrom: binaryPath,
+          scratchPath: null,
+        });
       }
-      await nap(pause);
-      pause = Math.min(pause * 2, 1000);
-      continue;
-    }
-    if (reply.status === 200) return;
-    if (reply.status === 409) return; // somebody already announced us; the first one stands
-    if (Date.now() - started > ANNOUNCE_WINDOW_MS) {
-      throw new Error(`the environment refused the registration with HTTP ${reply.status}`);
-    }
-    await reply.arrayBuffer().catch(() => undefined);
-    await nap(pause);
-    pause = Math.min(pause * 2, 1000);
-  }
-}
-
-async function trialFinished(origin: string): Promise<boolean> {
-  let reply: Response;
-  try {
-    reply = await fetch(withPath(origin, '/done'), {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(ASK_TIMEOUT_MS),
     });
-  } catch {
-    return false; // a dropped ask is not an answer; ask again next round
-  }
-  if (!reply.ok) {
-    await reply.arrayBuffer().catch(() => undefined);
-    return false;
-  }
-  let payload: unknown;
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+      if (stderr.length > 4096) stderr = stderr.slice(-4096);
+    });
+  });
+}
+
+/**
+ * Launch the forge, trying (in order): a scratch copy in os.tmpdir(), the
+ * repo copy itself, a scratch copy in $HOME/.cache. Returns the first
+ * candidate that announces a port. Throws with every failure listed.
+ */
+async function launchForge(): Promise<Launched> {
+  const failures: string[] = [];
+  const scratchPaths: string[] = [];
+
+  // Candidate 1: scratch copy in the system temp dir (the fix).
   try {
-    payload = await reply.json();
-  } catch {
-    return false;
+    const dest = path.join(tmpdir(), scratchName());
+    await copyFile(REPO_BINARY, dest);
+    await chmod(dest, 0o755);
+    scratchPaths.push(dest);
+    const launched = await trySpawn(dest);
+    launched.scratchPath = dest;
+    return launched;
+  } catch (err) {
+    failures.push(`tmpdir copy: ${(err as Error).message}`);
   }
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    (payload as Record<string, unknown>).done === true
-  );
+
+  // Candidate 2: the repo copy, after a best-effort chmod.
+  try {
+    await chmod(REPO_BINARY, 0o755).catch(() => undefined);
+    return await trySpawn(REPO_BINARY);
+  } catch (err) {
+    failures.push(`repo copy: ${(err as Error).message}`);
+  }
+
+  // Candidate 3: scratch copy in $HOME/.cache.
+  try {
+    const cacheDir = path.join(homedir(), ".cache");
+    await mkdir(cacheDir, { recursive: true });
+    const dest = path.join(cacheDir, scratchName());
+    await copyFile(REPO_BINARY, dest);
+    await chmod(dest, 0o755);
+    scratchPaths.push(dest);
+    const launched = await trySpawn(dest);
+    launched.scratchPath = dest;
+    return launched;
+  } catch (err) {
+    failures.push(`$HOME/.cache copy: ${(err as Error).message}`);
+  }
+
+  for (const p of scratchPaths) await unlink(p).catch(() => undefined);
+  throw new Error(`forge failed to launch from every location:\n- ${failures.join("\n- ")}`);
 }
 
-async function waitForFinish(origin: string): Promise<void> {
-  let pause = FIRST_WAIT_MS;
+/** POST {envUrl}/register {"port": N}; first register wins (409 = already). */
+async function register(envUrl: string, port: number): Promise<void> {
+  let lastError = "";
+  for (let attempt = 1; attempt <= REGISTER_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`${envUrl}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ port }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (res.status === 200 || res.status === 409) return;
+      lastError = `HTTP ${res.status}`;
+    } catch (err) {
+      lastError = (err as Error).message;
+    }
+    if (attempt < REGISTER_ATTEMPTS) await sleep(REGISTER_RETRY_MS);
+  }
+  throw new Error(`register failed after ${REGISTER_ATTEMPTS} attempts: ${lastError}`);
+}
+
+/** Poll GET {envUrl}/done until {"done": true}. Never returns early. */
+async function pollDone(envUrl: string): Promise<void> {
+  let attempt = 0;
   for (;;) {
-    if (await trialFinished(origin)) return;
-    await nap(pause);
-    pause = Math.min(pause * 2, LONGEST_WAIT_MS);
+    try {
+      const res = await fetch(`${envUrl}/done`, {
+        signal: AbortSignal.timeout(DONE_REQUEST_TIMEOUT_MS),
+      });
+      const body = (await res.json()) as unknown;
+      if (
+        typeof body === "object" &&
+        body !== null &&
+        (body as Record<string, unknown>).done === true
+      ) {
+        return;
+      }
+    } catch {
+      // The env may be briefly unreachable; keep polling.
+    }
+    const delay = Math.min(
+      DONE_POLL_MAX_MS,
+      Math.round(DONE_POLL_FIRST_MS * 2 ** attempt),
+    );
+    attempt += 1;
+    await sleep(delay);
   }
 }
 
-async function run(): Promise<number> {
-  const origin = envOrigin();
-  const { child, port } = await startForge();
+async function main(): Promise<void> {
+  const launched = await launchForge();
+  const { child, port } = launched;
+  console.log(`forge listening on port ${port} (binary: ${launched.launchedFrom})`);
 
-  const stop = (): void => {
-    child.kill('SIGTERM');
-    setTimeout(() => process.exit(EXIT_DONE), 1000).unref();
+  let exiting = false;
+  const shutdown = async (code: number) => {
+    if (exiting) return;
+    exiting = true;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    await sleep(500);
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    if (launched.scratchPath) {
+      await unlink(launched.scratchPath).catch(() => undefined);
+    }
+    process.exit(code);
   };
-  process.on('SIGTERM', stop);
-  process.on('SIGINT', stop);
-  child.once('exit', () => {
-    process.stderr.write('forge: the core exited early\n');
-    process.exit(EXIT_FAILED);
+  process.on("SIGTERM", () => void shutdown(0));
+  process.on("SIGINT", () => void shutdown(0));
+  child.on("exit", (code, signal) => {
+    if (!exiting) {
+      console.error(`forge exited unexpectedly code=${code} signal=${signal ?? "none"}`);
+      void shutdown(1);
+    }
   });
 
-  await announce(origin, port);
-  await waitForFinish(origin);
-  child.kill('SIGTERM');
-  return EXIT_DONE;
+  const envUrl = process.env.MAKEFUN_ENV_URL?.replace(/\/+$/, "");
+  if (!envUrl) {
+    // No trial env: a plain local run. Stay up until killed.
+    console.log("MAKEFUN_ENV_URL is unset; running without registering.");
+    await new Promise<void>(() => undefined);
+    return;
+  }
+
+  await register(envUrl, port);
+  console.log(`registered port ${port} with ${envUrl}`);
+  await pollDone(envUrl);
+  console.log("suite done; exiting 0");
+  await shutdown(0);
 }
 
-run()
-  .then((code) => process.exit(code))
-  .catch((err: unknown) => {
-    process.stderr.write(`forge lifecycle failed: ${err instanceof Error ? err.message : String(err)}\n`);
-    process.exit(EXIT_FAILED);
-  });
+main().catch((err: unknown) => {
+  console.error(`main.ts: ${(err as Error).message}`);
+  process.exit(1);
+});
